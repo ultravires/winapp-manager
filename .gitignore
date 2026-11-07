@@ -1,0 +1,12 @@
+# Rust 构建产物
+/target/
+
+# 二进制产物（部署副本）
+*.exe
+
+# 运行时配置（含本机应用清单，属个人数据）
+app_manager_config.json
+
+# 注册表备份等杂项
+*.reg
+uninstall-cleanup-backup/

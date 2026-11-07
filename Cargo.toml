@@ -1,0 +1,17 @@
+[package]
+name = "app_manager"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+eframe = "0.27"
+winreg = "0.52"
+walkdir = "2.5"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rfd = "0.14"
+winapi = { version = "0.3.9", features = ["shellapi", "winuser", "wingdi"] }
+
+[profile.release]
+opt-level = 2
+strip = true
