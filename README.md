@@ -2,6 +2,18 @@
 
 用 Rust 编写的 Windows 已安装应用管理工具。纯 Rust 实现（egui GUI），无 Node.js / WebView 依赖。
 
+## 下载
+
+发行版二进制通过 [GitHub Releases](https://github.com/ultravires/winapp-manager/releases/latest) 分发：下载 `winapp-manager-vX.Y.Z-x64.zip`，解压后运行 `app_manager.exe`。
+
+附件中的 `SHA256SUMS.txt` 记录了 exe 与 zip 的 SHA-256，下载后可自行核对：
+
+```powershell
+Get-FileHash .\winapp-manager-v0.1.0-x64.zip -Algorithm SHA256
+```
+
+> exe 未签名，首次运行可能被 SmartScreen / Defender 拦截（对无签名、零信誉新文件的常见误报）：点「更多信息 → 仍要运行」，或在 Defender 保护历史中允许。稳妥做法是先核对 SHA-256 再运行。
+
 ## 功能
 
 1. **自动扫描本地应用**：与「控制面板\程序\程序和功能」同源的注册表 Uninstall 列表（HKLM / HKLM-Wow64 / HKCU），过滤系统组件、KB 更新项，同名条目合并去重
@@ -47,3 +59,16 @@ cargo build --release
 `assets/app.ico` 由 Python 脚本生成（PIL 绘制 2×2 磁贴图样，含 16–256 共 7 档 BMP 条目）。
 
 中文字体：启动时加载 `C:\Windows\Fonts\msyh.ttc`（微软雅黑），避免 egui 默认字体缺汉字字形；可在「🔤 字体」中切换应用字体，选择持久化于配置文件的 `font` 字段。
+
+## 发布
+
+打 tag 推送即自动构建并发布 Release（`.github/workflows/release.yml`）：
+
+```powershell
+# 1. 确认 Cargo.toml 的 version 与 tag 一致（工作流会校验，不一致直接失败）
+# 2. 提交代码后打 tag 并推送
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+工作流流程：`cargo build --release --locked` → 打包 zip（exe + `SHA256SUMS.txt`）→ 上传 Actions artifact → 创建同名 Release 并附上产物；重跑同一 tag 会覆盖资产，不会重复建 Release。Actions 页面也可手动触发（workflow_dispatch），仅产出 artifact 供测试，不创建 Release。
