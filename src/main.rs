@@ -44,6 +44,8 @@ struct Config {
     apps: Vec<AppEntry>,
     #[serde(default)]
     scan_source: String,
+    #[serde(default)]
+    font: Option<String>, // 应用界面字体文件路径（None = 默认微软雅黑）
 }
 
 #[derive(Clone, PartialEq, Debug, Default)]
@@ -58,6 +60,12 @@ enum View {
 struct NewCatDialog {
     name: String,
     app_to_move: Option<String>,
+}
+
+#[derive(Clone)]
+struct FontItem {
+    name: String, // 注册表显示名（已去类型后缀）
+    path: String, // 字体文件完整路径
 }
 
 struct Counts {
@@ -81,6 +89,10 @@ struct AppManager {
     pending_inherit: Option<HashMap<String, String>>, // 数据源迁移时按名称继承分类
     scan_source: String,
     next_id: u64,
+    font_path: Option<String>, // 当前应用字体文件
+    font_dialog_open: bool,
+    font_filter: String,
+    font_list: Vec<FontItem>,
 }
 
 // ---------------------------------------------------------------------------
@@ -104,14 +116,14 @@ fn main() -> Result<(), eframe::Error> {
 impl AppManager {
     fn new(cc: &eframe::CreationContext) -> Self {
         let ctx = cc.egui_ctx.clone();
-        setup_fonts(&ctx);
         ctx.set_visuals(egui::Visuals::dark());
 
         let config_path = choose_config_path();
-        let (apps, categories, scan_source) = match load_config(&config_path) {
-            Some(c) => (c.apps, c.categories, c.scan_source),
-            None => (Vec::new(), Vec::new(), String::new()),
+        let (apps, categories, scan_source, font) = match load_config(&config_path) {
+            Some(c) => (c.apps, c.categories, c.scan_source, c.font),
+            None => (Vec::new(), Vec::new(), String::new(), None),
         };
+        setup_fonts(&ctx, font.as_deref());
 
         let mut app = Self {
             ctx,
@@ -127,6 +139,10 @@ impl AppManager {
             pending_inherit: None,
             scan_source,
             next_id: 0,
+            font_path: font,
+            font_dialog_open: false,
+            font_filter: String::new(),
+            font_list: Vec::new(),
         };
 
         // 为旧配置中缺少 id 的条目补齐唯一 id（身份标识，path 可能为空不可作身份）
@@ -186,6 +202,7 @@ impl AppManager {
             categories: self.categories.clone(),
             apps: self.apps.clone(),
             scan_source: self.scan_source.clone(),
+            font: self.font_path.clone(),
         };
         let Ok(s) = serde_json::to_string_pretty(&cfg) else {
             return;
@@ -479,6 +496,9 @@ impl AppManager {
                 }
                 if ui.button("🔄 重新扫描").clicked() {
                     self.rescan();
+                }
+                if ui.button("🔤 字体").clicked() {
+                    self.open_font_dialog();
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if !self.status.is_empty() {
@@ -855,6 +875,72 @@ impl AppManager {
             }
         }
     }
+
+    // -----------------------------------------------------------------------
+    // 字体设置
+    // -----------------------------------------------------------------------
+
+    fn open_font_dialog(&mut self) {
+        self.font_list = enumerate_fonts();
+        self.font_dialog_open = true;
+    }
+
+    fn apply_font(&mut self, ctx: &egui::Context, path: Option<&str>, name: &str) {
+        setup_fonts(ctx, path);
+        self.font_path = path.map(|s| s.to_string());
+        self.status = format!("🔤 字体已切换：{name}");
+        self.save_config();
+    }
+
+    fn font_dialog(&mut self, ctx: &egui::Context) {
+        if !self.font_dialog_open {
+            return;
+        }
+        let mut open = true;
+        egui::Window::new("字体设置")
+            .open(&mut open)
+            .collapsible(false)
+            .default_width(460.0)
+            .default_height(520.0)
+            .show(ctx, |ui| {
+                ui.weak("点击字体立即应用到本界面（中文始终有回退字体，不会缺字）：");
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    if ui.button("恢复默认").clicked() {
+                        self.apply_font(ctx, None, "默认（微软雅黑）");
+                    }
+                    ui.separator();
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.font_filter)
+                            .hint_text("🔍 过滤…")
+                            .desired_width(160.0),
+                    );
+                });
+                ui.separator();
+                let filter = self.font_filter.to_lowercase();
+                egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+                    let list = self.font_list.clone();
+                    for f in list {
+                        if !filter.is_empty() && !f.name.to_lowercase().contains(&filter) {
+                            continue;
+                        }
+                        let selected = self.font_path.as_deref() == Some(f.path.as_str());
+                        let label = if selected {
+                            format!("√ {}", f.name)
+                        } else {
+                            f.name.clone()
+                        };
+                        if ui.selectable_label(selected, label).clicked() {
+                            self.apply_font(ctx, Some(&f.path), &f.name);
+                        }
+                    }
+                });
+            });
+        if !open {
+            self.font_dialog_open = false;
+        }
+    }
+
 }
 
 impl eframe::App for AppManager {
@@ -863,6 +949,7 @@ impl eframe::App for AppManager {
         self.side_panel(ctx);
         self.central_panel(ctx);
         self.dialogs(ctx);
+        self.font_dialog(ctx);
     }
 }
 
@@ -1417,8 +1504,24 @@ unsafe fn hicon_to_rgba(hicon: winapi::shared::windef::HICON) -> Option<egui::Co
 // ---------------------------------------------------------------------------
 
 /// 加载系统中文字体（微软雅黑等），否则 egui 默认字体无法渲染中文
-fn setup_fonts(ctx: &egui::Context) {
+fn setup_fonts(ctx: &egui::Context, preferred: Option<&str>) {
     let mut fonts = egui::FontDefinitions::default();
+    // 用户设置的字体排在最前（拉丁与汉字均优先命中）
+    let mut front = 0usize;
+    if let Some(p) = preferred {
+        if !p.is_empty() && Path::new(p).is_file() {
+            if let Ok(data) = fs::read(p) {
+                fonts
+                    .font_data
+                    .insert("user_font".to_string(), egui::FontData::from_owned(data).into());
+                if let Some(fam) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
+                    fam.insert(0, "user_font".to_string());
+                    front = 1;
+                }
+            }
+        }
+    }
+    // CJK 回退始终保留，任何选择下中文都不会缺字形
     let candidates = [
         r"C:\Windows\Fonts\msyh.ttc",
         r"C:\Windows\Fonts\simhei.ttf",
@@ -1432,7 +1535,7 @@ fn setup_fonts(ctx: &egui::Context) {
                 .font_data
                 .insert(id.clone(), egui::FontData::from_owned(data).into());
             if let Some(fam) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
-                fam.insert(0, id.clone());
+                fam.insert(front, id.clone());
             }
             if let Some(fam) = fonts.families.get_mut(&egui::FontFamily::Monospace) {
                 fam.push(id);
@@ -1441,6 +1544,61 @@ fn setup_fonts(ctx: &egui::Context) {
         }
     }
     ctx.set_fonts(fonts);
+}
+
+/// 枚举系统已安装字体（HKLM / HKCU Fonts 注册表项），同名条目取文件名较短者
+fn enumerate_fonts() -> Vec<FontItem> {
+    use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ};
+    use winreg::RegKey;
+
+    let fonts_dir = PathBuf::from(r"C:\Windows\Fonts");
+    let mut by_name: HashMap<String, String> = HashMap::new();
+    for hive in [HKEY_LOCAL_MACHINE, HKEY_CURRENT_USER] {
+        let Ok(key) = RegKey::predef(hive).open_subkey_with_flags(
+            r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts",
+            KEY_READ,
+        ) else {
+            continue;
+        };
+        for (name, val) in key.enum_values().flatten() {
+            let file = val.to_string();
+            let file = file.trim().trim_matches('"');
+            if file.is_empty() {
+                continue;
+            }
+            let path = if file.contains('\\') {
+                PathBuf::from(file)
+            } else {
+                fonts_dir.join(file.split(',').next().unwrap_or(file))
+            };
+            if !path.is_file() {
+                continue;
+            }
+            let path = path.to_string_lossy().to_string();
+            // 显示名：去掉 " & ..." 连写与 " (TrueType)" 等类型后缀
+            let mut display = name.split(" & ").next().unwrap_or(&name).to_string();
+            if let Some(i) = display.find(" (") {
+                display.truncate(i);
+            }
+            if display.is_empty() {
+                continue;
+            }
+            let new_len = Path::new(&path).as_os_str().len();
+            let replace = match by_name.get(&display) {
+                None => true,
+                Some(old) => Path::new(old).as_os_str().len() > new_len,
+            };
+            if replace {
+                by_name.insert(display, path);
+            }
+        }
+    }
+    let mut out: Vec<FontItem> = by_name
+        .into_iter()
+        .map(|(name, path)| FontItem { name, path })
+        .collect();
+    out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    out
 }
 
 fn choose_config_path() -> PathBuf {
