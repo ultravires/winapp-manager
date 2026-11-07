@@ -4,7 +4,13 @@
 
 ## 下载
 
-发行版二进制通过 [GitHub Releases](https://github.com/ultravires/winapp-manager/releases/latest) 分发：下载 `winapp-manager-vX.Y.Z-x64.zip`，解压后运行 `app_manager.exe`。
+**winget（推荐）**——装完即可在 PATH 中直接运行 `app_manager`：
+
+```powershell
+winget install ultravires.WinAppManager
+```
+
+**GitHub Releases**——通过 [Releases](https://github.com/ultravires/winapp-manager/releases/latest) 下载 `winapp-manager-vX.Y.Z-x64.zip`，解压后运行 `app_manager.exe`。
 
 附件中的 `SHA256SUMS.txt` 记录了 exe 与 zip 的 SHA-256，下载后可自行核对：
 
@@ -72,3 +78,5 @@ git push origin v0.1.0
 ```
 
 工作流流程：`cargo build --release --locked` → 打包 zip（exe + `SHA256SUMS.txt`）→ 上传 Actions artifact → 创建同名 Release 并附上产物；重跑同一 tag 会覆盖资产，不会重复建 Release。Actions 页面也可手动触发（workflow_dispatch），仅产出 artifact 供测试，不创建 Release。
+
+Release 正式发布后还会自动向 winget 提交新版本清单（`.github/workflows/winget.yml`，需先配置 `WINGET_TOKEN` secret 并完成首次手动提交，见 `packaging/winget/README.md`）。

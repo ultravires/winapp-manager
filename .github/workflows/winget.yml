@@ -1,0 +1,26 @@
+name: winget
+
+# Release 正式发布后，自动向 microsoft/winget-pkgs 提交新版本清单（PR）
+on:
+  release:
+    types: [released]
+
+permissions: {}
+
+jobs:
+  submit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 向 winget-pkgs 提交新版本清单
+        uses: vedantmgoyal9/winget-releaser@main
+        with:
+          identifier: ultravires.WinAppManager
+          installers-regex: '\.zip$'
+          token: ${{ secrets.WINGET_TOKEN }}
+
+# 说明：
+# 1. 需要在仓库 Settings → Secrets and variables → Actions 配置 WINGET_TOKEN：
+#    GitHub 经典 PAT，勾选 public_repo 权限（该 PAT 账号需已签署 Microsoft CLA）。
+# 2. 此动作依赖包已存在于 winget-pkgs（它走 Komac update 流程），
+#    因此首个版本 0.1.0 需手动提交（见 packaging/winget/README.md），
+#    合入后此工作流才对后续版本生效。
