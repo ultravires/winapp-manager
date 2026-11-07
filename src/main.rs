@@ -100,10 +100,14 @@ struct AppManager {
 // ---------------------------------------------------------------------------
 
 fn main() -> Result<(), eframe::Error> {
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size([1080.0, 720.0])
+        .with_min_inner_size([720.0, 480.0]);
+    if let Some(icon) = window_icon() {
+        viewport = viewport.with_icon(icon);
+    }
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1080.0, 720.0])
-            .with_min_inner_size([720.0, 480.0]),
+        viewport,
         ..Default::default()
     };
     eframe::run_native(
@@ -111,6 +115,19 @@ fn main() -> Result<(), eframe::Error> {
         options,
         Box::new(|cc| Box::new(AppManager::new(cc))),
     )
+}
+
+/// 窗口 / 任务栏图标：内嵌的 assets/app.ico（256×256 帧），解码失败则用系统默认
+fn window_icon() -> Option<egui::IconData> {
+    const ICO: &[u8] = include_bytes!("../assets/app.ico");
+    let img = image::load_from_memory(ICO).ok()?;
+    let rgba = img.to_rgba8();
+    let (w, h) = (rgba.width(), rgba.height());
+    Some(egui::IconData {
+        width: w,
+        height: h,
+        rgba: rgba.into_raw(),
+    })
 }
 
 impl AppManager {

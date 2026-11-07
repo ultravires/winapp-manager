@@ -30,7 +30,7 @@ cargo build --release
 # 产物：target\release\app_manager.exe
 ```
 
-依赖：Rust stable (msvc)，Windows 10/11。
+依赖：Rust stable (msvc)，Windows 10/11。图标资源编译需要 Windows SDK 的 rc.exe（安装 VS 时勾选 SDK 即有）。
 
 ## 技术栈
 
@@ -42,5 +42,8 @@ cargo build --release
 | 启动 | ShellExecuteW（verb=open） |
 | 对话框 | rfd（IFileOpenDialog） |
 | 持久化 | serde_json |
+| 应用图标 | 内嵌 `assets/app.ico`：build.rs + winresource 编入 exe 资源（资源管理器/任务栏），启动时 image 解码后 `with_icon` 设为窗口图标 |
+
+`assets/app.ico` 由 Python 脚本生成（PIL 绘制 2×2 磁贴图样，含 16–256 共 7 档 BMP 条目）。
 
 中文字体：启动时加载 `C:\Windows\Fonts\msyh.ttc`（微软雅黑），避免 egui 默认字体缺汉字字形；可在「🔤 字体」中切换应用字体，选择持久化于配置文件的 `font` 字段。
