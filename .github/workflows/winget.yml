@@ -1,9 +1,18 @@
 name: winget
 
-# Release 正式发布后，自动向 microsoft/winget-pkgs 提交新版本清单（PR）
+# Release 正式发布后，自动向 microsoft/winget-pkgs 提交新版本清单（PR）。
+# 前提：release 由 PAT 创建（见 release.yml 的 GH_TOKEN）——GITHUB_TOKEN 的
+# release 事件不会触发本工作流。0.1.1 已错过自动触发，等 0.1.0（PR #474227）
+# 入库后可在 Actions 页手动触发本工作流、填 release_tag=v0.1.1 补交。
 on:
   release:
     types: [released]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: '要提交的 release tag（如 v0.1.1）'
+        required: true
+        type: string
 
 permissions: {}
 
@@ -16,6 +25,7 @@ jobs:
         with:
           identifier: ultravires.WinAppManager
           installers-regex: '\.zip$'
+          release-tag: ${{ inputs.release_tag || github.event.release.tag_name }}
           token: ${{ secrets.WINGET_TOKEN }}
 
 # 说明：

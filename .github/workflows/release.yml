@@ -68,7 +68,9 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         shell: pwsh
         env:
-          GH_TOKEN: ${{ github.token }}
+          # 用 PAT（而非内置 GITHUB_TOKEN）创建 release：GITHUB_TOKEN 触发的事件
+          # 不会级联触发 winget.yml（GitHub 限制），PAT 创建的 release 才能自动提交
+          GH_TOKEN: ${{ secrets.WINGET_TOKEN }}
           TAG: ${{ github.ref_name }}
         run: |
           gh release view $env:TAG 2>$null
