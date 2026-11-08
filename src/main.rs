@@ -1,7 +1,7 @@
 // 应用管理器 — Rust + egui 实现的 Windows 已安装应用管理工具
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -12,6 +12,8 @@ use walkdir::WalkDir;
 const TILE_W: f32 = 104.0;
 const TILE_H: f32 = 98.0;
 const ICON_SIZE: f32 = 46.0;
+/// 后台图标提取线程并发上限
+const MAX_ICON_WORKERS: usize = 6;
 
 // ---------------------------------------------------------------------------
 // 数据模型
@@ -75,6 +77,17 @@ struct Counts {
     removed: usize,
 }
 
+/// 后台图标任务
+enum IconJob {
+    /// 提取文件的真实图标（src 为图标来源路径）
+    Real { key: String, src: String },
+    /// 按扩展名取系统默认类型图标
+    Type { key: String, ext: String },
+}
+
+/// 图标提取结果：(缓存键, RGBA 图像)
+type IconResult = (String, Option<egui::ColorImage>);
+
 struct AppManager {
     ctx: egui::Context,
     apps: Vec<AppEntry>,
@@ -93,6 +106,16 @@ struct AppManager {
     font_dialog_open: bool,
     font_filter: String,
     font_list: Vec<FontItem>,
+    // 异步扫描：后台线程扫注册表/开始菜单，结果经 channel 回 UI 线程
+    scan_tx: std::sync::mpsc::Sender<Vec<ScannedApp>>,
+    scan_rx: std::sync::Mutex<std::sync::mpsc::Receiver<Vec<ScannedApp>>>,
+    scanning: bool,
+    // 异步图标：后台线程提取，未就绪的瓦片先画占位符
+    icon_tx: std::sync::mpsc::Sender<IconResult>,
+    icon_rx: std::sync::Mutex<std::sync::mpsc::Receiver<IconResult>>,
+    icon_queue: VecDeque<IconJob>,
+    icon_inflight: usize,
+    pending_icons: HashSet<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -142,6 +165,8 @@ impl AppManager {
         };
         setup_fonts(&ctx, font.as_deref());
 
+        let (scan_tx, scan_rx) = std::sync::mpsc::channel();
+        let (icon_tx, icon_rx) = std::sync::mpsc::channel();
         let mut app = Self {
             ctx,
             apps,
@@ -160,6 +185,14 @@ impl AppManager {
             font_dialog_open: false,
             font_filter: String::new(),
             font_list: Vec::new(),
+            scan_tx,
+            scan_rx: std::sync::Mutex::new(scan_rx),
+            scanning: false,
+            icon_tx,
+            icon_rx: std::sync::Mutex::new(icon_rx),
+            icon_queue: VecDeque::new(),
+            icon_inflight: 0,
+            pending_icons: HashSet::new(),
         };
 
         // 为旧配置中缺少 id 的条目补齐唯一 id（身份标识，path 可能为空不可作身份）
@@ -194,13 +227,11 @@ impl AppManager {
             app.scan_source = SCAN_SRC.to_string();
         }
 
-        app.rescan();
+        // 首次扫描放到后台线程：界面先用配置缓存立即渲染出来
+        app.start_rescan();
 
         if migrating {
-            app.status = format!(
-                "已切换到「程序和功能」数据源，旧分类按名称继承。{}",
-                app.status
-            );
+            app.status = "已切换到「程序和功能」数据源，旧分类按名称继承，正在扫描…".to_string();
         }
         app
     }
@@ -238,8 +269,38 @@ impl AppManager {
     // 扫描
     // -----------------------------------------------------------------------
 
-    fn rescan(&mut self) {
-        let found = scan_installed_apps();
+    /// 在后台线程启动一次扫描；完成后经 channel 交回 UI 线程（见 poll_scan / apply_scan）
+    fn start_rescan(&mut self) {
+        if self.scanning {
+            self.status = "⏳ 正在扫描中，请稍候…".to_string();
+            return;
+        }
+        self.scanning = true;
+        self.status = "🔍 正在扫描已安装应用…".to_string();
+        let tx = self.scan_tx.clone();
+        let ctx = self.ctx.clone();
+        std::thread::spawn(move || {
+            let found = scan_installed_apps();
+            let _ = tx.send(found);
+            ctx.request_repaint();
+        });
+    }
+
+    /// 在 UI 线程收取后台扫描结果（每帧调用）
+    fn poll_scan(&mut self) {
+        let found = {
+            let rx = self.scan_rx.lock().unwrap();
+            rx.try_recv().ok()
+        };
+        if let Some(found) = found {
+            self.apply_scan(found);
+        }
+    }
+
+    /// 应用扫描结果：合并新条目、继承旧分类、移除失效条目（UI 线程调用）
+    fn apply_scan(&mut self, found: Vec<ScannedApp>) {
+        self.scanning = false;
+        let migrating = self.pending_inherit.is_some();
         let mut added = 0usize;
         for s in found.iter() {
             let key = s.name.to_lowercase();
@@ -282,7 +343,13 @@ impl AppManager {
         let removed = before - self.apps.len();
         self.save_config();
         let visible = self.apps.iter().filter(|a| !a.hidden).count();
-        self.status = format!("扫描完成：新增 {added}，移除失效 {removed}，共 {visible} 个应用");
+        let result =
+            format!("扫描完成：新增 {added}，移除失效 {removed}，共 {visible} 个应用");
+        self.status = if migrating {
+            format!("已切换到「程序和功能」数据源，旧分类按名称继承。{result}")
+        } else {
+            result
+        };
     }
 
     // -----------------------------------------------------------------------
@@ -436,6 +503,8 @@ impl AppManager {
         v
     }
 
+    /// 图标纹理：真实图标后台异步提取，未就绪时返回 None（瓦片先画占位符）；
+    /// 提取失败（负缓存）则回退到按扩展名的系统默认类型图标（同样异步）
     fn icon_for(&mut self, app: &AppEntry) -> Option<egui::TextureHandle> {
         let src = if app.path.is_empty() {
             app.icon.clone()
@@ -443,7 +512,6 @@ impl AppManager {
             app.path.clone()
         };
 
-        // 先取真实图标（带负缓存）；失败则回退到系统默认类型图标（按扩展名共享缓存）
         if !src.is_empty() {
             let key = src.to_lowercase();
             let cached = self.icons.get(&key).cloned();
@@ -451,17 +519,8 @@ impl AppManager {
                 Some(Some(t)) => return Some(t),
                 Some(None) => {} // 真实图标不可用 → 走类型默认
                 None => {
-                    let tex = unsafe { extract_icon_rgba(&src) }.map(|img| {
-                        self.ctx.load_texture(
-                            format!("icon:{key}"),
-                            img,
-                            egui::TextureOptions::LINEAR,
-                        )
-                    });
-                    self.icons.insert(key, tex.clone());
-                    if let Some(t) = tex {
-                        return Some(t);
-                    }
+                    self.request_icon(IconJob::Real { key, src });
+                    return None; // 提取中
                 }
             }
         }
@@ -472,12 +531,71 @@ impl AppManager {
         if let Some(t) = cached {
             return t;
         }
-        let tex = unsafe { extract_default_icon_rgba(&ext) }.map(|img| {
-            self.ctx
-                .load_texture(format!("icon:{tkey}"), img, egui::TextureOptions::LINEAR)
-        });
-        self.icons.insert(tkey, tex.clone());
-        tex
+        self.request_icon(IconJob::Type { key: tkey, ext });
+        None
+    }
+
+    /// 把图标任务排入队列并启动后台提取（并发上限见 MAX_ICON_WORKERS）
+    fn request_icon(&mut self, job: IconJob) {
+        let key = match &job {
+            IconJob::Real { key, .. } | IconJob::Type { key, .. } => key.clone(),
+        };
+        if self.icons.contains_key(&key) || self.pending_icons.contains(&key) {
+            return;
+        }
+        self.pending_icons.insert(key);
+        self.icon_queue.push_back(job);
+        self.pump_icon_queue();
+    }
+
+    fn pump_icon_queue(&mut self) {
+        while self.icon_inflight < MAX_ICON_WORKERS {
+            let Some(job) = self.icon_queue.pop_front() else {
+                break;
+            };
+            self.icon_inflight += 1;
+            let tx = self.icon_tx.clone();
+            let ctx = self.ctx.clone();
+            std::thread::spawn(move || {
+                let img = match &job {
+                    IconJob::Real { src, .. } => unsafe { extract_icon_rgba(src) },
+                    IconJob::Type { ext, .. } => unsafe { extract_default_icon_rgba(ext) },
+                };
+                let key = match job {
+                    IconJob::Real { key, .. } | IconJob::Type { key, .. } => key,
+                };
+                let _ = tx.send((key, img));
+                ctx.request_repaint();
+            });
+        }
+    }
+
+    /// 收取后台图标提取结果并创建纹理（UI 线程每帧调用）
+    fn poll_icon_results(&mut self) {
+        let mut results: Vec<IconResult> = Vec::new();
+        {
+            let rx = self.icon_rx.lock().unwrap();
+            while let Ok(r) = rx.try_recv() {
+                results.push(r);
+            }
+        }
+        if results.is_empty() {
+            return;
+        }
+        for (key, img) in results {
+            self.icon_inflight -= 1;
+            self.pending_icons.remove(&key);
+            let tex = img.map(|img| {
+                self.ctx.load_texture(
+                    format!("icon:{key}"),
+                    img,
+                    egui::TextureOptions::LINEAR,
+                )
+            });
+            self.icons.insert(key, tex);
+        }
+        self.pump_icon_queue();
+        self.ctx.request_repaint(); // 新纹理就绪，再画一帧
     }
 
     fn launch_app(&mut self, app: &AppEntry) {
@@ -512,7 +630,7 @@ impl AppManager {
                     self.add_manual_app();
                 }
                 if ui.button("🔄 重新扫描").clicked() {
-                    self.rescan();
+                    self.start_rescan();
                 }
                 if ui.button("🔤 字体").clicked() {
                     self.open_font_dialog();
@@ -962,6 +1080,8 @@ impl AppManager {
 
 impl eframe::App for AppManager {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_scan();
+        self.poll_icon_results();
         self.top_panel(ctx);
         self.side_panel(ctx);
         self.central_panel(ctx);
