@@ -116,17 +116,65 @@ struct AppManager {
     icon_queue: VecDeque<IconJob>,
     icon_inflight: usize,
     pending_icons: HashSet<String>,
+    bench_frame: u32, // 临时：启动计时用
 }
 
 // ---------------------------------------------------------------------------
-// 入口
+// 启动耗时测量（临时，仅当设置 WINAPP_TIMING=1 时写 %TEMP%\winapp_timing.log；
+// WINAPP_BENCH=1 时在第二帧开始处退出，用于测端到端启动耗时）
 // ---------------------------------------------------------------------------
+mod timing {
+    use std::io::Write;
+    use std::sync::Mutex;
+    use std::time::Instant;
+
+    static START: Mutex<Option<Instant>> = Mutex::new(None);
+    static FILE: Mutex<Option<std::fs::File>> = Mutex::new(None);
+
+    pub fn init() {
+        let enabled =
+            std::env::var("WINAPP_TIMING").is_ok() || std::env::var("WINAPP_BENCH").is_ok();
+        if !enabled {
+            return;
+        }
+        *START.lock().unwrap() = Some(Instant::now());
+        let path = std::env::var("TEMP")
+            .map(|t| std::path::PathBuf::from(t).join("winapp_timing.log"))
+            .unwrap_or_else(|_| std::path::PathBuf::from("winapp_timing.log"));
+        *FILE.lock().unwrap() = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .ok();
+    }
+
+    pub fn mark(stage: &str) {
+        let Ok(g) = START.lock() else { return };
+        let Some(t) = g.as_ref() else { return };
+        let ms = t.elapsed().as_secs_f64() * 1000.0;
+        let line = format!("{ms:8.1} ms  {stage}\n");
+        drop(g);
+        if let Ok(mut f) = FILE.lock() {
+            if let Some(f) = f.as_mut() {
+                let _ = f.write_all(line.as_bytes());
+                let _ = f.flush();
+            }
+        }
+        if std::env::var("WINAPP_BENCH").is_ok() && stage == "frame_1_start" {
+            std::process::exit(0);
+        }
+    }
+}
 
 fn main() -> Result<(), eframe::Error> {
+    timing::init();
+    timing::mark("main_entry");
+    let icon = window_icon();
+    timing::mark("icon_decoded");
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([1080.0, 720.0])
         .with_min_inner_size([720.0, 480.0]);
-    if let Some(icon) = window_icon() {
+    if let Some(icon) = icon {
         viewport = viewport.with_icon(icon);
     }
     let options = eframe::NativeOptions {
@@ -155,6 +203,7 @@ fn window_icon() -> Option<egui::IconData> {
 
 impl AppManager {
     fn new(cc: &eframe::CreationContext) -> Self {
+        timing::mark("app_new_start"); // 此时 winit 窗口与 GL 上下文已建好
         let ctx = cc.egui_ctx.clone();
         ctx.set_visuals(egui::Visuals::dark());
 
@@ -163,7 +212,9 @@ impl AppManager {
             Some(c) => (c.apps, c.categories, c.scan_source, c.font),
             None => (Vec::new(), Vec::new(), String::new(), None),
         };
+        timing::mark("config_loaded");
         setup_fonts(&ctx, font.as_deref());
+        timing::mark("fonts_loaded");
 
         let (scan_tx, scan_rx) = std::sync::mpsc::channel();
         let (icon_tx, icon_rx) = std::sync::mpsc::channel();
@@ -193,6 +244,7 @@ impl AppManager {
             icon_queue: VecDeque::new(),
             icon_inflight: 0,
             pending_icons: HashSet::new(),
+            bench_frame: 0,
         };
 
         // 为旧配置中缺少 id 的条目补齐唯一 id（身份标识，path 可能为空不可作身份）
@@ -233,6 +285,7 @@ impl AppManager {
         if migrating {
             app.status = "已切换到「程序和功能」数据源，旧分类按名称继承，正在扫描…".to_string();
         }
+        timing::mark("app_new_done");
         app
     }
 
@@ -705,12 +758,19 @@ impl AppManager {
             if apps.is_empty() {
                 ui.add_space(80.0);
                 ui.vertical_centered(|ui| {
-                    ui.heading("没有应用");
-                    ui.add_space(8.0);
-                    if self.view == View::Removed {
-                        ui.weak("从列表移除的应用会出现在这里；右键图标可恢复");
+                    if self.scanning && self.view == View::All {
+                        // 首次启动时窗口先出现，应用列表随后由后台扫描填入
+                        ui.heading("🔍 正在扫描已安装应用…");
+                        ui.add_space(8.0);
+                        ui.weak("扫描完成后应用会自动出现在这里");
                     } else {
-                        ui.weak("点击右上角「➕ 添加应用」手动添加，或「🔄 重新扫描」自动检测");
+                        ui.heading("没有应用");
+                        ui.add_space(8.0);
+                        if self.view == View::Removed {
+                            ui.weak("从列表移除的应用会出现在这里；右键图标可恢复");
+                        } else {
+                            ui.weak("点击右上角「➕ 添加应用」手动添加，或「🔄 重新扫描」自动检测");
+                        }
                     }
                 });
                 return;
@@ -1080,6 +1140,11 @@ impl AppManager {
 
 impl eframe::App for AppManager {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.bench_frame += 1;
+        let first = self.bench_frame <= 2;
+        if first {
+            timing::mark(&format!("frame_{}_start", self.bench_frame - 1));
+        }
         self.poll_scan();
         self.poll_icon_results();
         self.top_panel(ctx);
@@ -1087,6 +1152,10 @@ impl eframe::App for AppManager {
         self.central_panel(ctx);
         self.dialogs(ctx);
         self.font_dialog(ctx);
+        if first {
+            timing::mark(&format!("frame_{}_done", self.bench_frame - 1));
+            ctx.request_repaint(); // 触发第二帧，bench 模式下第二帧开始即退出
+        }
     }
 }
 

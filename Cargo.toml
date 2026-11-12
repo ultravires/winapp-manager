@@ -4,7 +4,11 @@ version = "0.1.1"
 edition = "2021"
 
 [dependencies]
-eframe = "0.27"
+eframe = { version = "0.27", default-features = false, features = [
+    "glow",
+    "default_fonts",
+    "accesskit",
+] }
 winreg = "0.52"
 walkdir = "2.5"
 serde = { version = "1", features = ["derive"] }
@@ -18,4 +22,7 @@ winresource = "0.1"
 
 [profile.release]
 opt-level = 2
+lto = "fat"
+codegen-units = 1
+panic = "abort"
 strip = true
